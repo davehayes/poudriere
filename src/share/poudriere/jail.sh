@@ -43,6 +43,8 @@ Options:
     -v version    -- Specifies which version of FreeBSD we want in jail
     -a arch       -- Indicates architecture of the jail: i386 or amd64
                      (Default: same as host)
+    -D path       -- Specify a directory with jail sources. Use the \"dir\" method 
+                     with -m below or this switch will be ignored.
     -f fs         -- FS name (tank/jails/myjail) if fs is \"none\" then do not
                      create on zfs
     -M mountpoint -- mountpoint
@@ -55,6 +57,8 @@ Options:
                      Other possible method are: \"allbsd\" retrieve a
                      snapshot from allbsd.org's website or \"ftp-archive\"
                      for old releases that're no longer available on \"ftp\".
+                     Also can be \"dir\" which will install the sources from a 
+                     directory, specify this with the -D switch
     -p tree       -- Specify which ports tree the jail to start/stop with
     -P patch      -- Specify a patch file to apply to the source before committing.
     -t version    -- version to upgrade to
@@ -219,6 +223,16 @@ build_and_install_world() {
 	    err 1 "Failed to 'make distribution'"
 }
 
+install_from_dir() {
+	mkdir -p ${JAILMNT}/usr/src
+	if [ ! -d ${SRCSDIR} ] ; then
+		err 1 "You need to specify the sources directory with -D"
+	fi
+	(cd ${SRCSDIR}; tar cf - .) | (cd ${JAILMNT}/usr/src; tar xfp - )
+	build_and_install_world
+}
+
+
 install_from_svn() {
 	local UPDATE=0
 	local proto
@@ -382,6 +396,9 @@ create_jail() {
 	fi
 
 	case ${METHOD} in
+	dir)
+		FCT=install_from_dir
+		;;
 	ftp|http|gjb|ftp-archive)
 		FCT=install_from_ftp
 		;;
@@ -509,8 +526,11 @@ SCRIPTPREFIX=`dirname ${SCRIPTPATH}`
 
 TMPFS_ALL=0
 
-while getopts "J:j:v:a:z:m:n:f:M:sdklqcip:ut:z:P:" FLAG; do
+while getopts "D:J:j:v:a:z:m:n:f:M:sdklqcip:ut:z:P:" FLAG; do
 	case "${FLAG}" in
+		D)
+			SRCSDIR=${OPTARG}
+			;;
 		j)
 			JAILNAME=${OPTARG}
 			;;

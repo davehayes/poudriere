@@ -237,7 +237,12 @@ of FreeBSD to use in the jail. (Default: same as host)
 Specifies which
 .Ar method
 to use to create the jail.
-Could be csup, svn{,+http,+https,+file,+ssh), ftp, allbsd, or gjb (Default: ftp).
+Could be csup, svn{,+http,+https,+file,+ssh), ftp, allbsd, dir, or gjb (Default: ftp).
+.It Fl D Ar directory
+If you are using the dir argument to 
+.Ar method
+this specifies the directory to copy sources from. No checking is done as to
+whether the target directory has anything in it previously. Be careful.
 .It Fl f Ar filesystem
 Specifies the
 .Ar filesystem
