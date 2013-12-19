@@ -629,6 +629,14 @@ here:
 .Pp
 .Dl /usr/local/etc/poudriere.d/<jailname>-pkgs.conf
 .Dl /usr/local/etc/poudriere.d/<jailname>-<setname>-pkgs.conf
+.Pp
+.Ss Add directories to the end of PATH
+This is allowed by setting the environment variable
+.Pp
+.DL LOCALBASE_PATH
+.Pp
+Anything in this variable will be appended to the default PATH of the jail
+before bulk builds are done. 
 .Sh COMPATIBILITY
 The
 .Nm

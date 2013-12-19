@@ -1261,6 +1261,7 @@ build_port() {
 	# proper files, otherwise they'll hit 'package already installed'
 	# errors.
 	[ -z "${PORTTESTING}" ] && PORT_FLAGS="${PORT_FLAGS} NO_DEPENDS=yes"
+	JAILPATH=$(injail echo $PATH)
 
 	for phase in ${targets}; do
 		bset ${MY_JOBID} status "${phase}:${port}"
@@ -1384,9 +1385,15 @@ Try testport with -n to use PREFIX=LOCALBASE"
 			fi
 		fi
 
+		if [ "x$LOCALBASE_PATH" = "x" ]; then
+			ADDED_PATH=${JAILPATH}
+		else
+			ADDED_PATH=${JAILPATH}:${LOCALBASE_PATH}
+		fi
+
 		if [ "${phase#*-}" = "depends" ]; then
 			# No need for nohang or PORT_FLAGS for *-depends
-			injail env USE_PACKAGE_DEPENDS_ONLY=1 \
+			injail env "PATH=${ADDED_PATH}" USE_PACKAGE_DEPENDS_ONLY=1 \
 			    make -C ${portdir} ${phase} || return 1
 		else
 			# Only set PKGENV during 'package' to prevent
@@ -1403,7 +1410,7 @@ Try testport with -n to use PREFIX=LOCALBASE"
 			# 24 hours for 1 command, or 120 minutes with no log update
 			nohang ${MAX_EXECUTION_TIME:-86400} ${NOHANG_TIME:-7200} \
 				${log}/logs/${PKGNAME}.log \
-				injail env ${pkgenv} ${PORT_FLAGS} \
+				injail env "PATH=${ADDED_PATH}" ${pkgenv} ${PORT_FLAGS} \
 				make -C ${portdir} ${phase}
 			hangstatus=$? # This is done as it may return 1 or 2 or 3
 			if [ $hangstatus -ne 0 ]; then
