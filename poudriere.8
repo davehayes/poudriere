@@ -616,6 +616,14 @@ They will all be used in the jail, in the order shown:
 .Dl /usr/local/etc/poudriere.d/<jailname>-<tree>-make.conf
 .Dl /usr/local/etc/poudriere.d/<jailname>-<setname>-make.conf
 .Dl /usr/local/etc/poudriere.d/<jailname>-<tree>-<setname>-make.conf
+.Pp
+.Ss Add packages to the jail before building
+As an extreme measure, if you need packages installed into a jail before
+bulk builds, you can specify the package names one per line in a file located
+here:
+.Pp
+.Dl /usr/local/etc/poudriere.d/<jailname>-pkgs.conf
+.Dl /usr/local/etc/poudriere.d/<jailname>-<setname>-pkgs.conf
 .Sh COMPATIBILITY
 The
 .Nm

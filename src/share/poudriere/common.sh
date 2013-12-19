@@ -935,6 +935,26 @@ jail_start() {
 		injail mtree -eu -f /etc/mtree/BSD.var.dist -p /var >/dev/null 2>&1 || :
 		injail mtree -eu -f /etc/mtree/BSD.usr.dist -p /usr >/dev/null 2>&1 || :
 	fi
+
+	# Add packages to jails - yes the variable name is arbitrary
+	MY_PKGFILE="${POUDRIERED}/${JAILNAME}${SETNAME:+-${SETNAME}}-pkgs.conf"
+	if [ -f "${MY_PKGFILE}" ]; then
+		msg "Found custom package file ${MY_PKGFILE}"
+		MY_CUSTOM_PACKAGES=$(cat ${MY_PKGFILE} 2>/dev/null)
+		if [ -n "${MY_CUSTOM_PACKAGES}" ]; then
+			msg "Custom package installation data detected"
+			for pkg_name in ${MY_CUSTOM_PACKAGES} ; do
+				# The use of pkg_add likely really naive so I don't do anything
+				# with the error message other than store it and print it   
+				msg "...installing ${pkg_name}"
+				MY_ERRORS=$(injail pkg_add /packages/All/$pkg_name)
+				if [ "x${MY_ERRORS}" != "x" ] ; then
+					msg "......ERROR: $MY_ERRORS"
+				fi
+			done
+		fi
+	fi
+	
 }
 
 setup_makeconf() {
