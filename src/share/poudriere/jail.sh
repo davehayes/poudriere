@@ -85,7 +85,7 @@ delete_jail() {
 	jail_runs ${JAILNAME} &&
 		err 1 "Unable to delete jail ${JAILNAME}: it is running"
 	msg_n "Removing ${JAILNAME} jail..."
-	destroyfs ${JAILMNT} jail
+	TMPFS_ALL=0 destroyfs ${JAILMNT} jail
 	rm -rf ${POUDRIERED}/jails/${JAILNAME} || :
 	echo " done"
 }
@@ -247,17 +247,17 @@ install_from_svn() {
 	esac
 	if [ ${UPDATE} -eq 0 ]; then
 		msg_n "Checking out the sources from svn..."
-		svn -q co ${proto}://${SVN_HOST}/base/${VERSION} ${JAILMNT}/usr/src || err 1 " fail"
+		${SVN_CMD} -q co ${proto}://${SVN_HOST}/base/${VERSION} ${JAILMNT}/usr/src || err 1 " fail"
 		echo " done"
 		if [ -n "${SRCPATCHFILE}" ]; then
 			msg_n "Patching the sources with ${SRCPATCHFILE}"
-			svn -q patch ${SRCPATCHFILE} ${JAILMNT}/usr/src || err 1 " fail"
+			${SVN_CMD} -q patch ${SRCPATCHFILE} ${JAILMNT}/usr/src || err 1 " fail"
 			echo done
 		fi
 	else
 		msg_n "Updating the sources from svn..."
-		svn upgrade ${JAILMNT}/usr/src 2>/dev/null || :
-		svn -q update ${JAILMNT}/usr/src || err 1 " fail"
+		${SVN_CMD} upgrade ${JAILMNT}/usr/src 2>/dev/null || :
+		${SVN_CMD} -q update ${JAILMNT}/usr/src || err 1 " fail"
 		echo " done"
 	fi
 	build_and_install_world
@@ -417,8 +417,7 @@ create_jail() {
 		RELEASE="${ALLBSDVER}-JPSNAP/ftp"
 		;;
 	svn*)
-		SVN=`which svn`
-		test -z ${SVN} && err 1 "You need svn on your host to use svn method"
+		test -z ${SVN_CMD} && err 1 "You need svn on your host to use svn method"
 		case ${VERSION} in
 			stable/*![0-9]*)
 				err 1 "bad version number for stable version"
@@ -598,7 +597,7 @@ done
 METHOD=${METHOD:-ftp}
 if [ -n "${JAILNAME}" -a ${CREATE} -eq 0 ]; then
 	ARCH=$(jget ${JAILNAME} arch)
-	JAILFS=$(jget ${JAILNAME} fs)
+	JAILFS=$(jget ${JAILNAME} fs 2>/dev/null || :)
 	JAILMNT=$(jget ${JAILNAME} mnt)
 fi
 
@@ -615,6 +614,8 @@ case "${CREATE}${LIST}${STOP}${START}${DELETE}${UPDATE}" in
 		porttree_exists ${PTNAME} || err 2 "No such ports tree ${PTNAME}"
 		export MASTERNAME=${JAILNAME}-${PTNAME}${SETNAME:+-${SETNAME}}
 		export MASTERMNT=${POUDRIERE_DATA}/build/${MASTERNAME}/ref
+		jail_runs ${MASTERNAME} ||
+		    msg "Jail ${MASTERNAME} not running, but cleaning up anyway"
 		jail_stop
 		;;
 	000100)

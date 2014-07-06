@@ -78,7 +78,7 @@ build_repo() {
 		# remount rw
 		umount -f ${MASTERMNT}/packages
 		mount_packages
-		if [ -f "${PKG_REPO_SIGNING_KEY:-/nonexistent}" ]; then
+		if [ -n "${PKG_REPO_SIGNING_KEY}" ]; then
 			install -m 0400 ${PKG_REPO_SIGNING_KEY} \
 				${MASTERMNT}/tmp/repo.key
 			### XXX: Update pkg-repo to support -o
@@ -140,6 +140,9 @@ while getopts "B:f:j:J:CcNp:RFtTsvwz:a" FLAG; do
 		t)
 			export PORTTESTING=1
 			export DEVELOPER_MODE=yes
+			export NO_WARNING_PKG_INSTALL_EOL=yes
+			export WARNING_WAIT=0
+			export DEV_WARNING_WAIT=0
 			;;
 		T)
 			export TRYBROKEN=yes

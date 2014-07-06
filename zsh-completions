@@ -84,8 +84,10 @@ _testport=(
 	'(-o)-d[specify on which port we work]::path:_files -/'
 	'-c[run make config for the given port]::'
 	'-j[run only inside the given jail]::name:_poudriere_jail'
-	'-n[no custom prefix]::'
+	'-i[Interactive mode. Enter jail after build and automatically cleanup when done]'
+	'-I[Advanced interactive mode. Leave jail running but do not enter]'
 	'-p[specify on which portstree we work]::tree:_poudriere_pt'
+	'-P[use custom prefix]::'
 	'-v[Be verbose; show more information. Specify twice to enable debug output.]'
 	'-z[Specify on which SET to use]::'
 )

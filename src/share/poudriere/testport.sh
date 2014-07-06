@@ -39,8 +39,8 @@ Options:
     -j name     -- Run inside the given jail
     -i          -- Interactive mode. Enter jail for interactive testing and automatically cleanup when done.
     -I          -- Advanced Interactive mode. Leaves jail running with port installed after test.
-    -n          -- No custom prefix
     -p tree     -- Specify the path to the portstree
+    -P          -- Use custom prefix
     -s          -- Skip sanity checks
     -v          -- Be verbose; show more information. Use twice to enable debug output
     -z set      -- Specify which SET to use"
@@ -51,13 +51,13 @@ SCRIPTPATH=`realpath $0`
 SCRIPTPREFIX=`dirname ${SCRIPTPATH}`
 CONFIGSTR=0
 . ${SCRIPTPREFIX}/common.sh
-NOPREFIX=0
+NOPREFIX=1
 SETNAME=""
 SKIPSANITY=0
 INTERACTIVE_MODE=0
 PTNAME="default"
 
-while getopts "o:cnj:J:iIp:svz:" FLAG; do
+while getopts "o:cnj:J:iIp:Psvz:" FLAG; do
 	case "${FLAG}" in
 		c)
 			CONFIGSTR=1
@@ -66,7 +66,7 @@ while getopts "o:cnj:J:iIp:svz:" FLAG; do
 			ORIGIN=${OPTARG}
 			;;
 		n)
-			NOPREFIX=1
+			# Backwards-compat with NOPREFIX=1
 			;;
 		j)
 			jail_exists ${OPTARG} || err 1 "No such jail: ${OPTARG}"
@@ -83,6 +83,9 @@ while getopts "o:cnj:J:iIp:svz:" FLAG; do
 			;;
 		p)
 			PTNAME=${OPTARG}
+			;;
+		P)
+			NOPREFIX=0
 			;;
 		s)
 			SKIPSANITY=1
@@ -163,9 +166,14 @@ fi
 
 PKGENV="PACKAGES=/tmp/pkgs PKGREPOSITORY=/tmp/pkgs"
 mkdir -p ${MASTERMNT}/tmp/pkgs
-[ ${PKGNG} -eq 0 ] && injail mkdir -p ${PREFIX}
 PORTTESTING=yes
 export DEVELOPER_MODE=yes
+export NO_WARNING_PKG_INSTALL_EOL=yes
+# Disable waits unless running in a tty interactively
+if ! [ -t 1 ]; then
+	export WARNING_WAIT=0
+	export DEV_WARNING_WAIT=0
+fi
 sed -i '' '/DISABLE_MAKE_JOBS=poudriere/d' ${MASTERMNT}/etc/make.conf
 log_start
 buildlog_start /usr/ports/${ORIGIN}
@@ -216,16 +224,32 @@ if [ $INTERACTIVE_MODE -gt 0 ]; then
 	jstop
 	jstart 1
 
+	# Create a pkgng repo configuration, and disable FreeBSD
+	if [ ${PKGNG} -eq 1 ]; then
+		msg "Installing local Pkg repository to ${LOCALBASE}/etc/pkg/repos"
+		mkdir -p ${MASTERMNT}${LOCALBASE}/etc/pkg/repos
+		cat > ${MASTERMNT}${LOCALBASE}/etc/pkg/repos/local.conf << EOF
+FreeBSD: {
+	enabled: no
+}
+
+local: {
+	url: "file:///packages",
+	enabled: yes
+}
+EOF
+	fi
+
 	if [ $INTERACTIVE_MODE -eq 1 ]; then
 		msg "Entering interactive test mode. Type 'exit' when done."
 		injail env -i TERM=${SAVED_TERM} \
-			PACKAGESITE="file:///packages" /usr/bin/login -fp root
+			/usr/bin/login -fp root
 		[ -z "${failed_phase}" ] || err 1 "Build failed in phase: ${failed_phase}"
 	elif [ $INTERACTIVE_MODE -eq 2 ]; then
 		msg "Leaving jail ${MASTERNAME} running, mounted at ${MASTERMNT} for interactive run testing"
-		msg "To enter jail: jexec ${MASTERNAME} /bin/sh"
+		msg "To enter jail: jexec ${MASTERNAME} env -i TERM=\$TERM /usr/bin/login -fp root"
 		msg "To stop jail: poudriere jail -k -j ${MASTERNAME}"
-		CLEANING_UP=1
+		CLEANED_UP=1
 		exit 0
 	fi
 	print_phase_footer

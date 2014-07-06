@@ -40,8 +40,80 @@ was_a_bulk_run() {
 _wait() {
 	# Workaround 'wait' builtin possibly returning early due to signals
 	# by using 'pwait' to wait(2) and then 'wait' to collect return code
+	local ret=0 pid
+
 	pwait "$@" 2>/dev/null || :
-	wait "$@"
+	for pid in "$@"; do
+		wait ${pid} || ret=$?
+	done
+
+	return ${ret}
+}
+
+kill_and_wait() {
+	[ $# -eq 2 ] || eargs time pids
+	local time="$1"
+	local pids="$2"
+	local ret=0
+	local pid
+	local found_pid
+	local retry
+
+	[ -z "${pids}" ] && return 0
+
+	# Give children $time seconds to exit and then force kill
+	retry=${time}
+	kill ${pids} 2>/dev/null || :
+
+	while [ ${retry} -gt 0 ]; do
+		found_pid=0
+		for pid in ${pids}; do
+			if kill -0 ${pid} 2>/dev/null; then
+				sleep 1
+				found_pid=1
+				break
+			fi
+		done
+		retry=$((retry - 1))
+		[ ${found_pid} -eq 0 ] && retry=0
+	done
+
+	# Kill all children instead of waiting on them
+	[ ${found_pid} -eq 1 ] && kill -9 ${pids} 2>/dev/null || :
+
+	_wait ${pids} || ret=$?
+
+	return ${ret}
+}
+
+# Based on Shell Scripting Recipes - Chris F.A. Johnson (c) 2005
+# Replace a pattern without needing a subshell/exec
+_gsub() {
+	[ $# -ne 3 ] && eargs string pattern replacement
+	local string="$1"
+	local pattern="$2"
+	local replacement="$3"
+	local result_l= result_r="${string}"
+
+	while :; do
+		case ${result_r} in
+			*${pattern}*)
+				result_l=${result_l}${result_r%%${pattern}*}${replacement}
+				result_r=${result_r#*${pattern}}
+				;;
+			*)
+				break
+				;;
+		esac
+	done
+
+	_gsub="${result_l}${result_r}"
+}
+
+
+gsub() {
+	_gsub "$@"
+	echo "${_gsub}"
 }
 
 err() {
@@ -69,6 +141,10 @@ msg_verbose() {
 msg_debug() {
 	[ ${VERBOSE:-0} -gt 1 ] || return 0
 	msg "DEBUG: $1" >&2
+}
+
+warn() {
+	msg "WARNING: $@" >&2
 }
 
 job_msg() {
@@ -158,7 +234,7 @@ log_start() {
 	exec 3>&1 4>&2
 	[ ! -e ${logfile}.pipe ] && mkfifo ${logfile}.pipe
 	tee ${logfile} < ${logfile}.pipe >&3 &
-	export tpid=$!
+	tpid=$!
 	exec > ${logfile}.pipe 2>&1
 
 	# Remove fifo pipe file right away to avoid orphaning it.
@@ -182,7 +258,21 @@ buildlog_start() {
 	echo "maintained by: $(injail make -C ${portdir} maintainer)"
 	echo "Makefile ident: $(ident ${mnt}/${portdir}/Makefile|sed -n '2,2p')"
 	echo "Poudriere version: ${POUDRIERE_VERSION}"
-	echo ""
+	echo "Host OSVERSION: ${HOST_OSVERSION}"
+	echo "Jail OSVERSION: ${JAIL_OSVERSION}"
+	echo
+	if [ ${JAIL_OSVERSION} -gt ${HOST_OSVERSION} ]; then
+		echo
+		echo
+		echo
+		echo "!!! Jail is newer than host. (Jail: ${JAIL_OSVERSION}, Host: ${HOST_OSVERSION}) !!!"
+		echo "!!! This is not supported. !!!"
+		echo "!!! Host kernel must be same or newer than jail. !!!"
+		echo "!!! Expect build failures. !!!"
+		echo
+		echo
+		echo
+	fi
 	echo "---Begin Environment---"
 	injail env ${PKGENV} ${PORT_FLAGS}
 	echo "---End Environment---"
@@ -224,8 +314,8 @@ buildlog_stop() {
 log_stop() {
 	if [ -n "${tpid}" ]; then
 		exec 1>&3 3>&- 2>&4 4>&-
-		kill $tpid
-		_wait $tpid 2>/dev/null || :
+		kill $tpid 2>/dev/null || :
+		_wait $tpid 2>/dev/null 1>&2 || :
 		unset tpid
 	fi
 }
@@ -512,7 +602,7 @@ rollbackfs() {
 		mtree_mnt="${mnt}"
 	fi
 	
-	cpdup -i0 -X ${MASTERMNT}/usr/src -X ${MASTERMNT}/poudriere ${MASTERMNT} ${mnt}
+	cpdup -i0 -x ${MASTERMNT} ${mnt}
 }
 
 umountfs() {
@@ -578,7 +668,6 @@ markfs() {
 		;;
 	prebuild|prestage) domtree=1 ;;
 	preinst) domtree=1 ;;
-	poststage) domtree=1 ;;
 	esac
 
 	if [ $dozfs -eq 1 ]; then
@@ -592,7 +681,7 @@ markfs() {
 	mkdir -p ${mnt}/poudriere/
 
 	case "${name}" in
-		prepkg|poststage)
+		prepkg)
 			cat > ${mnt}/poudriere/mtree.${name}exclude << EOF
 .${HOME}/.ccache/*
 ./ccache/*
@@ -699,7 +788,7 @@ clonefs() {
 		# Mount /usr/src into target, no need for anything to write to it
 		mkdir -p ${to}/usr/src
 		mount -t nullfs -o ro ${from}/usr/src ${to}/usr/src
-		cpdup -X ${from}/usr/src -X ${from}/poudriere ${from} ${to}
+		cpdup -x ${from} ${to}
 	fi
 }
 
@@ -853,6 +942,7 @@ jail_start() {
 	local tomnt=${POUDRIERE_DATA}/build/${MASTERNAME}/ref
 
 	[ -d ${DISTFILES_CACHE:-/nonexistent} ] || err 1 "DISTFILES_CACHE directory does not exist. (c.f. poudriere.conf)"
+	[ $(sysctl -n kern.securelevel) -lt 1 ] || err 1 "kern.securelevel >= 1. Poudriere requires no securelevel to be able to handle schg flags."
 
 	if [ -z "${NOLINUX}" ]; then
 		if [ "${arch}" = "i386" -o "${arch}" = "amd64" ]; then
@@ -888,7 +978,19 @@ jail_start() {
 	[ ${SET_STATUS_ON_START-1} -eq 1 ] && export STATUS=1
 	msg_n "Creating the reference jail..."
 	clonefs ${mnt} ${tomnt} clean
+	echo "src" >> ${tomnt}/usr/.cpignore
+	echo "poudriere" >> ${tomnt}/.cpignore
 	echo " done"
+
+	JAIL_OSVERSION=$(awk '/\#define __FreeBSD_version/ { print $3 }' "${mnt}/usr/include/sys/param.h")
+
+	if [ ${JAIL_OSVERSION} -gt ${HOST_OSVERSION} ]; then
+		warn "!!! Jail is newer than host. (Jail: ${JAIL_OSVERSION}, Host: ${HOST_OSVERSION}) !!!"
+		warn "This is not supported."
+		warn "Host kernel must be same or newer than jail."
+		warn "Expect build failures."
+		sleep 5
+	fi
 
 	msg "Mounting system devices for ${MASTERNAME}"
 	do_jail_mounts ${tomnt} ${arch}
@@ -922,6 +1024,10 @@ jail_start() {
 		export PKG_BIN="${LOCALBASE:-/usr/local}/sbin/pkg-static"
 		export PKG_ADD="${PKG_BIN} add"
 		export PKG_DELETE="${PKG_BIN} delete -y -f"
+
+		[ -n "${PKG_REPO_SIGNING_KEY}" ] &&
+			! [ -f "${PKG_REPO_SIGNING_KEY}" ] &&
+			err 1 "PKG_REPO_SIGNING_KEY defined but the file is missing."
 	else
 		export PKGNG=0
 		export PKG_ADD=pkg_add
@@ -971,20 +1077,18 @@ setup_makeconf() {
 	for opt in ${makeconf}; do
 		append_make ${opt} ${dst_makeconf}
 	done
+
+	# We will handle DEVELOPER for testing when appropriate
+	sed -i '' '/^DEVELOPER=/d' ${dst_makeconf}
 }
 
 jail_stop() {
 	[ $# -ne 0 ] && eargs
-	if ! jail_runs ${MASTERNAME}; then
-		[ -n "${CLEANING_UP}" ] && return 0
-		err 1 "No such jail running: ${MASTERNAME}"
-	fi
-	local fs=$(zfs_getfs ${MASTERMNT})
 
 	# err() will set status to 'crashed', don't override.
 	[ -n "${CRASHED}" ] || bset status "stop:" 2>/dev/null || :
 
-	jstop
+	jstop || :
 	# Shutdown all builders
 	if [ ${PARALLEL_JOBS} -ne 0 ]; then
 		# - here to only check for unset, {start,stop}_builders will set this to blank if already stopped
@@ -994,7 +1098,7 @@ jail_stop() {
 		done
 	fi
 	msg "Umounting file systems"
-	destroyfs ${MASTERMNT} jail
+	destroyfs ${MASTERMNT} jail || :
 	rm -rf ${MASTERMNT}/../
 	export STATUS=0
 }
@@ -1069,34 +1173,60 @@ check_leftovers() {
 			mtree -X ${mnt}/poudriere/mtree.preinstexclude \
 			    -f ${mnt}/poudriere/mtree.preinst \
 			    -p ${mnt}
-		else
-			markfs poststage ${mnt} ${stagedir}
-			injail mtree -f /poudriere/mtree.poststage \
-			    -e -L -p /
 		fi
 	} | while read l ; do
-		case ${l} in
-		*extra)
-			if [ -d ${mnt}/${l% *} ]; then
-				find ${mnt}/${l% *} -exec echo "+ {}" \;
-			else
-				echo "+ ${mnt}/${l% *}"
-			fi
-			;;
-		*missing)
-			l=${l#./}
-			echo "- ${mnt}/${l% *}"
-			;;
-		*changed) echo "M ${mnt}/${l% *}" ;;
-		extra:*)
-			if [ -d ${mnt}/${l#* } ]; then
-				find ${mnt}/${l#* } -exec echo "+ {}" \;
-			else
-				echo "+ ${mnt}/${l#* }"
-			fi
-			;;
-		*:*) echo "M ${mnt}/${l%:*}" ;;
-		esac
+		local changed read_again
+
+		changed=
+		while :; do
+			read_again=0
+
+			# Handle leftover read from changed paths
+			case ${l} in
+			*extra|*missing|extra:*|*changed|*:*)
+				if [ -n "${changed}" ]; then
+					echo "${changed}"
+					changed=
+				fi
+				;;
+			esac
+			case ${l} in
+			*extra)
+				if [ -d ${mnt}/${l% *} ]; then
+					find ${mnt}/${l% *} -exec echo "+ {}" \;
+				else
+					echo "+ ${mnt}/${l% *}"
+				fi
+				;;
+			*missing)
+				l=${l#./}
+				echo "- ${mnt}/${l% *}"
+				;;
+			*changed)
+				changed="M ${mnt}/${l% *}"
+				read_again=1
+				;;
+			extra:*)
+				if [ -d ${mnt}/${l#* } ]; then
+					find ${mnt}/${l#* } -exec echo "+ {}" \;
+				else
+					echo "+ ${mnt}/${l#* }"
+				fi
+				;;
+			*:*)
+				changed="M ${mnt}/${l%:*} ${l#*:}"
+				read_again=1
+				;;
+			*)
+				changed="${changed} ${l}"
+				read_again=1
+				;;
+			esac
+			# Need to read again to find all changes
+			[ ${read_again} -eq 1 ] && read l && continue
+			[ -n "${changed}" ] && echo "${changed}"
+			break
+		done
 	done
 }
 
@@ -1236,10 +1366,10 @@ build_port() {
 	local log=$(log_path)
 	local listfilecmd network
 	local hangstatus
-	local pkgenv
+	local pkgenv phaseenv
 	local no_stage=$(injail make -C ${portdir} -VNO_STAGE)
 	local targets install_order build_fs_violation_check_target
-	local stagedir plistsub_sed
+	local stagedir
 
 	# Must install run-depends as 'actual-package-depends' and autodeps
 	# only consider installed packages as dependencies
@@ -1251,7 +1381,7 @@ build_port() {
 		build_fs_violation_check_target="run-depends"
 		stagedir=$(injail make -C ${portdir} -VSTAGEDIR)
 	fi
-	targets="check-config pkg-depends fetch-depends fetch checksum \
+	targets="check-sanity pkg-depends fetch-depends fetch checksum \
 		  extract-depends extract patch-depends patch build-depends \
 		  lib-depends configure build ${install_order} \
 		  ${PORTTESTING:+deinstall}"
@@ -1264,6 +1394,7 @@ build_port() {
 	JAILPATH=$(injail echo $PATH)
 
 	for phase in ${targets}; do
+		phaseenv=
 		bset ${MY_JOBID} status "${phase}:${port}"
 		job_msg_verbose "Status for build ${port}: ${phase}"
 		if [ "${phase}" = "fetch" ]; then
@@ -1271,6 +1402,7 @@ build_port() {
 			jstart 1
 		fi
 		case ${phase} in
+		check-sanity) [ -n "${PORTTESTING}" ] && phaseenv="DEVELOPER=1" ;;
 		configure) [ -n "${PORTTESTING}" ] && markfs prebuild ${mnt} ;;
 		${build_fs_violation_check_target})
 			if [ -n "${PORTTESTING}" ]; then
@@ -1318,73 +1450,6 @@ build_port() {
 				${mnt}/new_packages
 		fi
 
-		if [ "${phase}" = "deinstall" ]; then
-			plistsub_sed=$(injail env ${PORT_FLAGS} make -C ${portdir} -V'PLIST_SUB:C/"//g:NLIB32*:NPERL_*:NPREFIX*:N*="":N*="@comment*:C/(.*)=(.*)/-es!\2!%%\1%%!g/')
-			PREFIX=$(injail env ${PORT_FLAGS} make -C ${portdir} -VPREFIX)
-			if [ -z "${no_stage}" ]; then
-				msg "Checking for orphaned files and directories in stage directory (missing from plist)"
-				bset ${MY_JOBID} status "stage_orphans:${port}"
-				local orphans=$(mktemp ${mnt}/tmp/orphans.XXXXXX)
-				local die=0
-
-				check_leftovers ${mnt} ${stagedir} | \
-				    while read modtype path; do
-					local ppath
-
-					# If this is a directory, use @dirrm in output
-					if [ -d "${path}" ]; then
-						ppath="@dirrm "`echo $path | sed \
-							-e "s,^${mnt},," \
-							-e "s,^${PREFIX}/,," \
-							${plistsub_sed} \
-						`
-					else
-						ppath=`echo "$path" | sed \
-							-e "s,^${mnt},," \
-							-e "s,^${PREFIX}/,," \
-							${plistsub_sed} \
-						`
-					fi
-					# Ignore PREFIX as orphan, which
-					# happens via stage-dir if
-					# NO_MTREE is set
-					[ "${path#${mnt}}" != "${PREFIX}" ] &&
-					  [ "${path#${mnt}}" != "/usr" ] &&
-					  [ "${path#${mnt}}" != "/." ] &&
-					    echo "${ppath}" >> ${orphans}
-				done
-
-				if [ -s "${orphans}" ]; then
-					msg "Files or directories orphaned:"
-					die=1
-					grep -v "^@dirrm" ${orphans}
-					grep "^@dirrm" ${orphans} | sort -r
-				fi
-				[ ${die} -eq 1 -a "${0##*/}" = "testport.sh" -a \
-				    "${PREFIX}" != "${LOCALBASE}" ] && msg \
-				    "This test was done with PREFIX!=LOCALBASE which \
-may show failures if the port does not respect PREFIX. \
-Try testport with -n to use PREFIX=LOCALBASE"
-				rm -f ${orphans}
-				[ $die -eq 0 ] || return 1
-
-				msg "Checking for absolute symlinks into staging directory"
-				bset ${MY_JOBID} status "stage_symlinks:${port}"
-				if [ ${PKGNG} -eq 1 ]; then
-					injail ${PKG_BIN} query %Fp ${PKGNAME}
-				else
-					injail pkg_info -qL ${PKGNAME}
-				fi | tr '\n' '\0' | injail xargs -0 -J % \
-				    find % -type l -print0 |
-				    injail xargs -0 stat -l |
-				    grep "${portdir}/work/stage" && die=1
-				if [ ${die} -eq 1 ]; then
-					msg "Port is installing absolute symlinks into stagedir"
-					return 1
-				fi
-			fi
-		fi
-
 		if [ "x$LOCALBASE_PATH" = "x" ]; then
 			ADDED_PATH=${JAILPATH}
 		else
@@ -1393,7 +1458,7 @@ Try testport with -n to use PREFIX=LOCALBASE"
 
 		if [ "${phase#*-}" = "depends" ]; then
 			# No need for nohang or PORT_FLAGS for *-depends
-			injail env "PATH=${ADDED_PATH}" USE_PACKAGE_DEPENDS_ONLY=1 \
+			injail env "PATH=${ADDED_PATH}" USE_PACKAGE_DEPENDS_ONLY=1 ${phaseenv} \
 			    make -C ${portdir} ${phase} || return 1
 		else
 			# Only set PKGENV during 'package' to prevent
@@ -1410,7 +1475,7 @@ Try testport with -n to use PREFIX=LOCALBASE"
 			# 24 hours for 1 command, or 120 minutes with no log update
 			nohang ${MAX_EXECUTION_TIME:-86400} ${NOHANG_TIME:-7200} \
 				${log}/logs/${PKGNAME}.log \
-				injail env "PATH=${ADDED_PATH}" ${pkgenv} ${PORT_FLAGS} \
+				injail env "PATH=${ADDED_PATH}" ${pkgenv} ${phaseenv} ${PORT_FLAGS} \
 				make -C ${portdir} ${phase}
 			hangstatus=$? # This is done as it may return 1 or 2 or 3
 			if [ $hangstatus -ne 0 ]; then
@@ -1442,9 +1507,34 @@ Try testport with -n to use PREFIX=LOCALBASE"
 			gather_distfiles ${portdir} ${mnt}/portdistfiles || return 1
 		fi
 
+		if [ "${phase}" = "stage" -a -n "${PORTTESTING}" ]; then
+			local die=0
+
+			bset ${MY_JOBID} status "stage-qa:${port}"
+			if ! injail env DEVELOPER=1 ${PORT_FLAGS} \
+			    make -C ${portdir} stage-qa; then
+				msg "Error: stage-qa failures detected"
+				[ "${PORTTESTING_FATAL}" != "no" ] &&
+					return 1
+				die=1
+			fi
+
+			bset ${MY_JOBID} status "check-plist:${port}"
+			if ! injail env DEVELOPER=1 ${PORT_FLAGS} \
+			    make -C ${portdir} check-plist; then
+				msg "Error: check-plist failures detected"
+				[ "${PORTTESTING_FATAL}" != "no" ] &&
+					return 1
+				die=1
+			fi
+
+			if [ ${die} -eq 1 ]; then
+				testfailure=2
+				die=0
+			fi
+		fi
+
 		if [ "${phase}" = "deinstall" ]; then
-			msg "Checking for extra files and directories"
-			bset ${MY_JOBID} status "leftovers:${port}"
 			local add=$(mktemp ${mnt}/tmp/add.XXXXXX)
 			local add1=$(mktemp ${mnt}/tmp/add1.XXXXXX)
 			local del=$(mktemp ${mnt}/tmp/del.XXXXXX)
@@ -1452,60 +1542,97 @@ Try testport with -n to use PREFIX=LOCALBASE"
 			local mod=$(mktemp ${mnt}/tmp/mod.XXXXXX)
 			local mod1=$(mktemp ${mnt}/tmp/mod1.XXXXXX)
 			local die=0
+			PREFIX=$(injail env ${PORT_FLAGS} make -C ${portdir} -VPREFIX)
 
-			check_leftovers ${mnt} | \
-				while read modtype path; do
-				local ppath ignore_path=0
+			msg "Checking for extra files and directories"
+			bset ${MY_JOBID} status "leftovers:${port}"
 
-				# If this is a directory, use @dirrm in output
-				if [ -d "${path}" ]; then
-					ppath="@dirrm "`echo $path | sed \
-						-e "s,^${mnt},," \
-						-e "s,^${PREFIX}/,," \
-						${plistsub_sed} \
-					`
-				else
-					ppath=`echo "$path" | sed \
-						-e "s,^${mnt},," \
-						-e "s,^${PREFIX}/,," \
-						${plistsub_sed} \
-					`
-				fi
-				case $modtype in
-				+)
-					case "${ppath}" in
-					*) echo "${ppath}" >> ${add} ;;
+			if [ -f "${mnt}/usr/ports/Mk/Scripts/check_leftovers.sh" ]; then
+				check_leftovers ${mnt} | sed -e "s|${mnt}||" |
+				    injail env PORTSDIR=/usr/ports \
+				    ${PORT_FLAGS} /bin/sh \
+				    /usr/ports/Mk/Scripts/check_leftovers.sh \
+				    ${port} | while read modtype data; do
+					case "${modtype}" in
+						+) echo "${data}" >> ${add} ;;
+						-) echo "${data}" >> ${del} ;;
+						M) echo "${data}" >> ${mod} ;;
 					esac
-					;;
-				-)
-					# Skip if it is PREFIX and non-LOCALBASE. See misc/kdehier4
-					# or mail/qmail for examples
-					[ "${path#${mnt}}" = "${PREFIX}" -a \
-						"${LOCALBASE}" != "${PREFIX}" ] && ignore_path=1
+				done
+			else
+				# LEGACY - Support for older ports tree.
+				local users user homedirs plistsub_sed
+				plistsub_sed=$(injail env ${PORT_FLAGS} make -C ${portdir} -V'PLIST_SUB:C/"//g:NLIB32*:NPERL_*:NPREFIX*:N*="":N*="@comment*:C/(.*)=(.*)/-es!\2!%%\1%%!g/')
 
-					if [ $ignore_path -eq 0 ]; then
-						echo "${ppath}" >> ${del}
+				users=$(injail make -C ${portdir} -VUSERS)
+				homedirs=""
+				for user in ${users}; do
+					user=$(grep ^${user}: ${mnt}/usr/ports/UIDs | cut -f 9 -d : | sed -e "s|/usr/local|${PREFIX}| ; s|^|${mnt}|")
+					homedirs="${homedirs} ${user}"
+				done
+
+				check_leftovers ${mnt} | \
+					while read modtype path extra; do
+					local ppath ignore_path=0
+
+					# If this is a directory, use @dirrm in output
+					if [ -d "${path}" ]; then
+						ppath="@dirrm "`echo $path | sed \
+							-e "s,^${mnt},," \
+							-e "s,^${PREFIX}/,," \
+							${plistsub_sed} \
+						`
+					else
+						ppath=`echo "$path" | sed \
+							-e "s,^${mnt},," \
+							-e "s,^${PREFIX}/,," \
+							${plistsub_sed} \
+						`
 					fi
-					;;
-				M)
-					[ -d "${path}" ] && continue
-					case "${ppath}" in
-					# This is a cache file for gio modules could be modified for any gio modules
-					lib/gio/modules/giomodule.cache) ;;
-					# removal of info files leaves entry uneasy to cleanup in info/dir
-					# accept a modification of this file
-					info/dir) ;;
-					# The is pear database cache
-					%%PEARDIR%%/.depdb|%%PEARDIR%%/.filemap) ;;
-					#ls-R files from texmf are often regenerated
-					*/ls-R);;
-					# xmlcatmgr is constantly updating catalog.ports ignore modification to that file
-					share/xml/catalog.ports);;
-					*) echo "${ppath}" >> ${mod} ;;
+					case $modtype in
+					+)
+						if [ -d "${path}" ]; then
+							# home directory of users created
+							case " ${homedirs} " in
+							*\ ${path}\ *) continue;;
+							*\ ${path}/*\ *) continue;;
+							esac
+						fi
+						case "${ppath}" in
+						*) echo "${ppath}" >> ${add} ;;
+						esac
+						;;
+					-)
+						# Skip if it is PREFIX and non-LOCALBASE. See misc/kdehier4
+						# or mail/qmail for examples
+						[ "${path#${mnt}}" = "${PREFIX}" -a \
+							"${LOCALBASE}" != "${PREFIX}" ] && ignore_path=1
+
+						if [ $ignore_path -eq 0 ]; then
+							echo "${ppath}" >> ${del}
+						fi
+						;;
+					M)
+						[ -d "${path}" ] && continue
+						case "${ppath}" in
+						# This is a cache file for gio modules could be modified for any gio modules
+						lib/gio/modules/giomodule.cache) ;;
+						# removal of info files leaves entry uneasy to cleanup in info/dir
+						# accept a modification of this file
+						info/dir) ;;
+						# The is pear database cache
+						%%PEARDIR%%/.depdb|%%PEARDIR%%/.filemap) ;;
+						#ls-R files from texmf are often regenerated
+						*/ls-R);;
+						# xmlcatmgr is constantly updating catalog.ports ignore modification to that file
+						share/xml/catalog.ports);;
+						*) echo "${ppath#@dirrm } ${extra}" >> ${mod} ;;
+						esac
+						;;
 					esac
-					;;
-				esac
-			done
+				done
+			fi
+
 			sort ${add} > ${add1}
 			sort ${del} > ${del1}
 			sort ${mod} > ${mod1}
@@ -1671,27 +1798,39 @@ ${dependency_cycles}"
 
 	# No cycle, there's some unknown poudriere bug
 	err 1 "Unknown stuck queue bug detected. Please submit the entire build output to poudriere developers.
-$(find ${MASTERMNT}/poudriere/building ${MASTERMNT}/poudriere/pool ${MASTERMNT}/poudriere/deps)"
+$(find ${MASTERMNT}/poudriere/building ${MASTERMNT}/poudriere/pool ${MASTERMNT}/poudriere/deps ${MASTERMNT}/poudriere/cleaning)"
 }
 
 queue_empty() {
-	local pool_dir
-	dirempty ${MASTERMNT}/poudriere/deps || return 1
+	local pool_dir lock dirs
 
-	for pool_dir in ${POOL_BUCKET_DIRS}; do
-		dirempty ${pool_dir} || return 1
+	# Lock on balance_pool to avoid race here while it is moving between
+	# /unbalanced and a balanced slot
+	lock=${MASTERMNT}/poudriere/.lock-balance_pool
+	mkdir ${lock} 2>/dev/null || return 1
+
+	dirs="${MASTERMNT}/poudriere/deps ${MASTERMNT}/poudriere/pool/unbalanced ${POOL_BUCKET_DIRS}"
+
+	for pool_dir in ${dirs}; do
+		if ! dirempty ${pool_dir}; then
+			rmdir ${lock}
+			return 1
+		fi
 	done
 
+	rmdir ${lock}
 	return 0
 }
 
 mark_done() {
 	[ $# -eq 1 ] || eargs pkgname
 	local pkgname="$1"
-	local origin=$(cache_get_origin "${pkgname}")
-	local cache_dir=$(cache_dir)
+	local origin cache_dir
 
 	if [ "${TRACK_BUILDTIMES:-no}" != "no" ]; then
+		origin=$(cache_get_origin "${pkgname}")
+		cache_dir=$(cache_dir)
+
 		echo -n "${origin} $(date +%s) " >> ${cache_dir}/buildtimes
 		stat -f "%m" ${MASTERMNT}/poudriere/building/${pkgname} >> \
 			${cache_dir}/buildtimes
@@ -1722,8 +1861,12 @@ build_queue() {
 				read pkgname < ${MASTERMNT}/poudriere/var/run/${j}.pkgname
 				rm -f ${MASTERMNT}/poudriere/var/run/${j}.pid \
 					${MASTERMNT}/poudriere/var/run/${j}.pkgname
-				bset ${j} status "idle:"
-				mark_done ${pkgname}
+				if [ "$(bget ${j} status)" = "stopped:" ]; then
+					mark_done ${pkgname}
+					bset ${j} status "idle:"
+				else
+					bset ${j} status "crashed:"
+				fi
 			fi
 
 			[ ${queue_empty} -eq 0 ] || continue
@@ -1798,7 +1941,7 @@ stop_html_json() {
 	local log=$(log_path)
 	if [ -n "${JSON_PID}" ]; then
 		kill ${JSON_PID} 2>/dev/null || :
-		_wait ${JSON_PID} 2>/dev/null || :
+		_wait ${JSON_PID} 2>/dev/null 1>&2 || :
 		unset JSON_PID
 	fi
 	build_json 2>/dev/null || :
@@ -1865,6 +2008,8 @@ clean_pool() {
 	local clean_rdepends=$2
 	local port skipped_origin
 
+	[ -n "${MY_JOBID}" ] && bset ${MY_JOBID} status "clean_pool:"
+
 	[ ${clean_rdepends} -eq 1 ] && port=$(cache_get_origin "${pkgname}")
 
 	# Cleaning queue (pool is cleaned here)
@@ -1914,9 +2059,11 @@ build_pkg() {
 
 	# Stop everything first
 	jstop
-	rollbackfs prepkg ${mnt}
+	[ -f ${mnt}/.need_rollback ] && rollbackfs prepkg ${mnt}
 	# Make sure we start with no network
 	jstart 0
+
+	touch ${mnt}/.need_rollback
 
 	# If this port is IGNORED, skip it
 	# This is checked here instead of when building the queue
@@ -1998,6 +2145,8 @@ stop_build() {
 
 	buildlog_stop ${portdir}
 	log_stop
+
+	bset ${MY_JOBID} status "stopped:"
 }
 
 # Crazy redirection is to add the portname into stderr.
@@ -2036,8 +2185,8 @@ list_deps() {
 	local makeargs="-VPKG_DEPENDS -VBUILD_DEPENDS -VEXTRACT_DEPENDS -VLIB_DEPENDS -VPATCH_DEPENDS -VFETCH_DEPENDS -VRUN_DEPENDS"
 
 	mangle_stderr "WARNING" "($1)" injail make -C ${dir} $makeargs | \
-		tr '\n' ' ' | sed -e "s,[[:graph:]]*/usr/ports/,,g" \
-		-e "s,:[[:graph:]]*,,g" | \
+		sed -e "s,[[:graph:]]*/usr/ports/,,g" \
+		-e "s,:[[:graph:]]*,,g" -e '/^$/d' | tr ' ' '\n' | \
 		sort -u || err 1 "Makefile broken: $1"
 }
 
@@ -2062,6 +2211,7 @@ pkg_get_origin() {
 	local pkg="$1"
 	local originfile="$(pkg_cache_dir "${pkg}")/origin"
 	local origin=$2
+	local new_origin
 
 	if [ ! -f "${originfile}" ]; then
 		if [ -z "${origin}" ]; then
@@ -2077,6 +2227,8 @@ pkg_get_origin() {
 	else
 		read origin < "${originfile}"
 	fi
+
+	check_moved new_origin ${origin} && origin=${new_origin}
 	echo ${origin}
 }
 
@@ -2085,6 +2237,7 @@ pkg_get_dep_origin() {
 	local pkg="$1"
 	local dep_origin_file="$(pkg_cache_dir "${pkg}")/dep_origin"
 	local compiled_dep_origins
+	local origin new_origin _old_dep_origins
 
 	if [ ! -f "${dep_origin_file}" ]; then
 		if [ "${PKG_EXT}" = "tbz" ]; then
@@ -2095,11 +2248,24 @@ pkg_get_dep_origin() {
 				"/packages/All/${pkg##*/}" '%do' | tr '\n' ' ')
 		fi
 		echo "${compiled_dep_origins}" > "${dep_origin_file}"
-		echo "${compiled_dep_origins}"
-		return 0
+	else
+		while read line; do
+			compiled_dep_origins="${compiled_dep_origins} ${line}"
+		done < "${dep_origin_file}"
 	fi
 
-	cat "${dep_origin_file}"
+	# Check MOVED
+	_old_dep_origins="${compiled_dep_origins}"
+	compiled_dep_origins=
+	for origin in ${_old_dep_origins}; do
+		if check_moved new_origin "${origin}"; then
+			compiled_dep_origins="${compiled_dep_origins} ${new_origin}"
+		else
+			compiled_dep_origins="${compiled_dep_origins} ${origin}"
+		fi
+	done
+
+	echo "${compiled_dep_origins}"
 }
 
 pkg_get_options() {
@@ -2302,7 +2468,7 @@ delete_old_pkg() {
 	# Check if the compiled options match the current options from make.conf and /var/db/options
 	if [ "${CHECK_CHANGED_OPTIONS:-verbose}" != "no" ]; then
 		current_options=$(injail make -C /usr/ports/${o} pretty-print-config | \
-			tr ' ' '\n' | sed -n 's/^\+\(.*\)/\1/p' | sort | tr '\n' ' ')
+			tr ' ' '\n' | sed -n 's/^\+\(.*\)/\1/p' | sort -u | tr '\n' ' ')
 		compiled_options=$(pkg_get_options "${pkg}")
 
 		if [ "${compiled_options}" != "${current_options}" ]; then
@@ -2443,6 +2609,8 @@ compute_deps() {
 }
 
 listed_ports() {
+	local tell_moved="${1}"
+
 	if [ ${ALL:-0} -eq 1 ]; then
 		PORTSDIR=$(pget ${PTNAME} mnt)
 		[ -d "${PORTSDIR}/ports" ] && PORTSDIR="${PORTSDIR}/ports"
@@ -2451,12 +2619,26 @@ listed_ports() {
 		done
 		return 0
 	fi
-	if [ -z "${LISTPORTS}" ]; then
-		[ -n "${LISTPKGS}" ] &&
-			grep -h -v -E '(^[[:space:]]*#|^[[:space:]]*$)' ${LISTPKGS}
-	else
-		echo ${LISTPORTS} | tr ' ' '\n'
-	fi
+
+	{
+		# -f specified
+		if [ -z "${LISTPORTS}" ]; then
+			[ -n "${LISTPKGS}" ] &&
+			    grep -h -v -E \
+			    '(^[[:space:]]*#|^[[:space:]]*$)' ${LISTPKGS} |
+			    sed 's,/*$,,'
+		else
+			# Ports specified on cmdline
+			echo ${LISTPORTS} | tr ' ' '\n' | sed 's,/*$,,'
+		fi
+	} | while read origin; do
+		if check_moved new_origin ${origin}; then
+			[ -n "${tell_moved}" ] && msg \
+			    "MOVED: ${origin} renamed to ${new_origin}" >&2
+			origin=${new_origin}
+		fi
+		echo "${origin}"
+	done
 }
 
 parallel_exec() {
@@ -2506,11 +2688,13 @@ parallel_start() {
 # list.
 _reap_children() {
 	local pid
+	local ret=0
+
 	for pid in ${PARALLEL_PIDS}; do
 		# Check if this pid is still alive
 		if ! kill -0 ${pid} 2>/dev/null; then
 			# This will error out if the return status is non-zero
-			_wait ${pid}
+			_wait ${pid} || ret=$?
 			# Remove pid from PARALLEL_PIDS and strip away all
 			# spaces
 			PARALLEL_PIDS_L=${PARALLEL_PIDS%% ${pid} *}
@@ -2522,47 +2706,54 @@ _reap_children() {
 			PARALLEL_PIDS=" ${PARALLEL_PIDS_L} ${PARALLEL_PIDS_R} "
 		fi
 	done
+
+	return ${ret}
 }
 
 # Wait on all remaining running processes and clean them up. Error out if
 # any have non-zero return status.
 parallel_stop() {
-	pwait ${PARALLEL_PIDS} 2>/dev/null || :
-	for pid in ${PARALLEL_PIDS}; do
-		# This will read the return code of each child
-		# and properly error out if the children errored
-		wait ${pid}
-	done
+	local ret=0
+	local do_wait="${1:-1}"
+
+	if [ ${do_wait} -eq 1 ]; then
+		_wait ${PARALLEL_PIDS} || ret=$?
+	fi
 
 	exec 6<&-
 	exec 6>&-
 	unset PARALLEL_PIDS
 	unset NBPARALLEL
+
+	return ${ret}
 }
 
 parallel_shutdown() {
-	# Kill all children instead of waiting on them
-	[ -n "${PARALLEL_PIDS}" ] && kill -9 ${PARALLEL_PIDS} 2>/dev/null || :
-	parallel_stop 2>/dev/null || :
+	kill_and_wait 30 "${PARALLEL_PIDS}" 2>/dev/null || :
+	# Reap the pids
+	parallel_stop 0 2>/dev/null || :
 }
 
 parallel_run() {
 	local cmd="$1"
 	shift 1
 
-	if [ ${NBPARALLEL} -eq ${PARALLEL_JOBS} ]; then
-		unset a; until trappedinfo=; read a <&6 || [ -z "$trappedinfo" ]; do :; done
-	fi
-	[ ${NBPARALLEL} -lt ${PARALLEL_JOBS} ] && NBPARALLEL=$((NBPARALLEL + 1))
 	# Occasionally reap dead children. Don't do this too often or it
 	# becomes a bottleneck. Do it too infrequently and there is a risk
 	# of PID reuse/collision
-	_SHOULD_REAP=$((_SHOULD_REAP + 1))
+	_SHOULD_REAP=$((${_SHOULD_REAP} + 1))
 	if [ ${_SHOULD_REAP} -eq 16 ]; then
-		_reap_children
 		_SHOULD_REAP=0
+		_reap_children || return $?
 	fi
 
+	# Only read once all slots are taken up; burst jobs until maxed out.
+	# NBPARALLEL is never decreased and only inreased until maxed.
+	if [ ${NBPARALLEL} -eq ${PARALLEL_JOBS} ]; then
+		unset a; until trappedinfo=; read a <&6 || [ -z "$trappedinfo" ]; do :; done
+	fi
+
+	[ ${NBPARALLEL} -lt ${PARALLEL_JOBS} ] && NBPARALLEL=$((NBPARALLEL + 1))
 	PARALLEL_CHILD=1 parallel_exec $cmd "$@" &
 	PARALLEL_PIDS="${PARALLEL_PIDS} $! "
 }
@@ -2610,12 +2801,42 @@ find_all_pool_references() {
 	fi
 }
 
+load_moved() {
+	msg "Loading MOVED"
+	bset status "loading_moved:"
+	mkdir ${MASTERMNT}/poudriere/MOVED
+	grep -v '^#' ${MASTERMNT}/usr/ports/MOVED | awk \
+	    -F\| '
+		$2 != "" {
+			sub("/", "_", $1);
+			print $1,$2;
+		}' | while read old_origin new_origin; do
+			echo ${new_origin} > \
+			    ${MASTERMNT}/poudriere/MOVED/${old_origin}
+		done
+}
+
+check_moved() {
+	[ $# -lt 2 ] && eargs var_return origin
+	local var_return="$1"
+	local origin="$2"
+	local _new_origin
+
+	_gsub ${origin} "/" "_"
+	[ -f "${MASTERMNT}/poudriere/MOVED/${_gsub}" ] &&
+	    read _new_origin < "${MASTERMNT}/poudriere/MOVED/${_gsub}"
+
+	setvar "${var_return}" "${_new_origin}"
+
+	# Return 0 if blank
+	[ -n "${_new_origin}" ]
+}
+
 prepare_ports() {
 	local pkg
 	local log=$(log_path)
 	local n port pn nbq resuming_build
 
-	msg "Calculating ports order and dependencies"
 	mkdir -p "${MASTERMNT}/poudriere"
 	[ ${TMPFS_DATA} -eq 1 -o ${TMPFS_ALL} -eq 1 ] && mount -t tmpfs tmpfs "${MASTERMNT}/poudriere"
 	rm -rf "${MASTERMNT}/poudriere/var/cache/origin-pkgname" \
@@ -2624,6 +2845,8 @@ prepare_ports() {
 		"${MASTERMNT}/poudriere/pool" \
 		"${MASTERMNT}/poudriere/deps" \
 		"${MASTERMNT}/poudriere/rdeps" \
+		"${MASTERMNT}/poudriere/cleaning/deps" \
+		"${MASTERMNT}/poudriere/cleaning/rdeps" \
 		"${MASTERMNT}/poudriere/var/run" \
 		"${MASTERMNT}/poudriere/var/cache" \
 		"${MASTERMNT}/poudriere/var/cache/origin-pkgname" \
@@ -2635,10 +2858,10 @@ prepare_ports() {
 		for n in $(jot ${POOL_BUCKETS} 0 | sort -nr); do
 			POOL_BUCKET_DIRS="${POOL_BUCKET_DIRS} ${MASTERMNT}/poudriere/pool/${n}"
 		done
+	else
+		POOL_BUCKET_DIRS="${MASTERMNT}/poudriere/pool/unbalanced"
 	fi
-	# Add unbalanced at the end
-	POOL_BUCKET_DIRS="${POOL_BUCKET_DIRS} ${MASTERMNT}/poudriere/pool/unbalanced"
-	mkdir -p ${POOL_BUCKET_DIRS}
+	mkdir -p ${POOL_BUCKET_DIRS} ${MASTERMNT}/poudriere/pool/unbalanced
 
 	mkdir -p ${log}/../../latest-per-pkg ${log}/../latest-per-pkg
 	mkdir -p ${log}/logs ${log}/logs/errors
@@ -2646,9 +2869,12 @@ prepare_ports() {
 	ln -sfh ${BUILDNAME} ${log%/*}/latest
 	cp ${HTMLPREFIX}/* ${log}
 
+	load_moved
+
+	msg "Calculating ports order and dependencies"
 	bset status "computingdeps:"
 	parallel_start
-	for port in $(listed_ports); do
+	for port in $(listed_ports show_moved); do
 		[ -d "${MASTERMNT}/usr/ports/${port}" ] ||
 			err 1 "Invalid port origin: ${port}"
 		parallel_run compute_deps ${port}
@@ -2756,10 +2982,14 @@ balance_pool() {
 
 	local pkgname pkg_dir dep_count rdep lock
 
-	! dirempty ${MASTERMNT}/poudriere/pool/unbalanced || return 0
 	# Avoid running this in parallel, no need
 	lock=${MASTERMNT}/poudriere/.lock-balance_pool
 	mkdir ${lock} 2>/dev/null || return 0
+
+	if dirempty ${MASTERMNT}/poudriere/pool/unbalanced; then
+		rmdir ${lock}
+		return 0
+	fi
 
 	if [ -n "${MY_JOBID}" ]; then
 		bset ${MY_JOBID} status "balancing_pool:"
@@ -2813,7 +3043,7 @@ LIBEXECPREFIX=${SCRIPTPREFIX}/../../libexec/poudriere
 AWKPREFIX=${SCRIPTPREFIX}/awk
 HTMLPREFIX=${SCRIPTPREFIX}/html
 HOOKDIR=${POUDRIERED}/hooks
-PATH="${LIBEXECPREFIX}:${PATH}"
+PATH="${LIBEXECPREFIX}:${PATH}:/sbin:/usr/sbin"
 
 # If the zfs module is not loaded it means we can't have zfs
 [ -z "${NO_ZFS}" ] && lsvfs zfs >/dev/null 2>&1 || NO_ZFS=yes
@@ -2837,11 +3067,19 @@ fi
 : ${SVN_HOST="svn.FreeBSD.org"}
 : ${GIT_URL="git://github.com/freebsd/freebsd-ports.git"}
 : ${FREEBSD_HOST="http://ftp.FreeBSD.org"}
+: ${SVN_CMD:=$(which svn 2>/dev/null || which svnlite 2>/dev/null)}
 if [ -z "${NO_ZFS}" ]; then
 	: ${ZROOTFS="/poudriere"}
 	case ${ZROOTFS} in
 	[!/]*) err 1 "ZROOTFS shoud start with a /" ;;
 	esac
+fi
+
+HOST_OSVERSION="$(sysctl -n kern.osreldate)"
+if [ -z "${NO_ZFS}" -a -z "${ZFS_DEADLOCK_IGNORED}" ]; then
+	[ ${HOST_OSVERSION} -gt 900000 -a \
+	    ${HOST_OSVERSION} -le 901502 ] && err 1 \
+	    "FreeBSD 9.1 ZFS is not safe. It is known to deadlock and cause system hang. Either upgrade the host or set ZFS_DEADLOCK_IGNORED=yes in poudriere.conf"
 fi
 
 [ -n "${MFSSIZE}" -a -n "${USE_TMPFS}" ] && err 1 "You can't use both tmpfs and mdmfs"
@@ -2934,7 +3172,7 @@ fi
 case $IPS in
 01)
 	localipargs="ip6.addr=::1"
-	ipargs="ip6.addr=inherit"
+	ipargs="ip6=inherit"
 	;;
 10)
 	localipargs="ip4.addr=127.0.0.1"

@@ -113,7 +113,7 @@ sort -u ${DISTFILES_LIST} > ${DISTFILES_LIST}.expected
 # Gather list of actual files
 msg "Gathering list of actual distfiles"
 [ -n "${DISTFILES_CACHE}" ] || err 1 "DISTFILES_CACHE is required to be set"
-find -x -s ${DISTFILES_CACHE}/ -type f > ${DISTFILES_LIST}.actual
+find -x ${DISTFILES_CACHE}/ -type f | sort > ${DISTFILES_LIST}.actual
 
 comm -1 -3 ${DISTFILES_LIST}.expected ${DISTFILES_LIST}.actual \
 	> ${DISTFILES_LIST}.unexpected
@@ -124,6 +124,9 @@ if [ ${file_cnt} -eq 0 ]; then
 	msg "No stale distfiles to cleanup"
 	exit 0
 fi
+
+[ -s "${DISTFILES_LIST}.expected" ] || \
+	err 1 "Something went wrong. All distfiles would have been removed."
 
 hsize=$(cat ${DISTFILES_LIST}.unexpected | xargs stat -f %z | \
 	awk '{total += $1} END {print total}' | \
